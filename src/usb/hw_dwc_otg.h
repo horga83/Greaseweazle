@@ -16,7 +16,7 @@
 #define IFACE_HS_EMBEDDED 1
 #define IFACE_HS_ULPI     2
 
-#define conf_port PORT_HS
+#define conf_port PORT_FS
 #define conf_iface IFACE_FS
 #define conf_nr_ep 4
 

@@ -22,6 +22,21 @@ static void canary_check(void)
     ASSERT(_thread_stackbottom[0] == 0xdeadbeef);
 }
 
+static void disco_reset(void)
+{
+    printk("Reset\n");
+}
+
+static void disco_configure(void)
+{
+    printk("Configure\n");
+}
+
+const struct usb_class_ops usb_cdc_acm_ops = {
+    .reset = disco_reset,
+    .configure = disco_configure
+};
+
 int main(void)
 {
     /* Relocate DATA. Initialise BSS. */
@@ -34,19 +49,19 @@ int main(void)
     time_init();
     console_init();
     console_crash_on_input();
-    board_init();
+//    board_init();
 
     printk("\n** Greaseweazle v%u.%u\n", fw_major, fw_minor);
     printk("** Keir Fraser <keir.xen@gmail.com>\n");
     printk("** https://github.com/keirf/Greaseweazle\n\n");
 
-    floppy_init();
+//    floppy_init();
     usb_init();
 
     for (;;) {
         canary_check();
         usb_process();
-        floppy_process();
+//        floppy_process();
     }
 
     return 0;

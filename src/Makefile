@@ -8,7 +8,7 @@ OBJS += stm32$(stm32).o
 OBJS += time.o
 OBJS += timer.o
 OBJS += util.o
-OBJS += floppy.o
+#OBJS += floppy.o
 
 OBJS-$(debug) += console.o
 
