@@ -24,6 +24,27 @@ static void core_reset(void)
     do { delay_us(1); } while (otg->grstctl & OTG_GRSTCTL_CSRST);
 }
 
+static void hsphyc_init(void)
+{
+    /* Enable the LDO and wait for it to be ready. */
+    hsphyc->ldo |= HSPHYC_LDO_ENABLE;
+    do { delay_us(1); } while (!(hsphyc->ldo & HSPHYC_LDO_STATUS));
+
+    /* HSE must be 25MHz! SEL(3) for 16MHz. */
+    hsphyc->pll1 |= HSPHYC_PLL1_SEL(5);
+
+    /* Magic values from the LL driver. We can probably discard them. */
+    hsphyc->tune |= (HSPHYC_TUNE_HSDRVCHKITRIM(7) |
+                     HSPHYC_TUNE_HSDRVRFRED |
+                     HSPHYC_TUNE_HSDRVDCCUR |
+                     HSPHYC_TUNE_INCURRINT |
+                     HSPHYC_TUNE_INCURREN);
+
+    /* Enable the PLL and wait to stabilise. */
+    hsphyc->pll1 |= HSPHYC_PLL1_EN;
+    delay_ms(2);
+}
+
 static void flush_tx_fifo(int num)
 {
     otg->grstctl = OTG_GRSTCTL_TXFFLSH | OTG_GRSTCTL_TXFNUM(num);
@@ -95,11 +116,15 @@ void usb_init(void)
         rcc->ahb2enr |= RCC_AHB2ENR_OTGFSEN;
         break;
     case PORT_HS:
+#if 0
         gpio_set_af(gpiob, 14, 12);
         gpio_set_af(gpiob, 15, 12);
         gpio_configure_pin(gpiob, 14, AFO_pushpull(IOSPD_HIGH));
         gpio_configure_pin(gpiob, 15, AFO_pushpull(IOSPD_HIGH));
+#endif
         rcc->ahb1enr |= RCC_AHB1ENR_OTGHSEN;
+        rcc->ahb1enr |= RCC_AHB1ENR_OTGHSULPIEN;
+        rcc->apb2enr |= RCC_APB2ENR_OTGPHYCEN;
         break;
     default:
         ASSERT(0);
@@ -118,6 +143,12 @@ void usb_init(void)
         core_reset();
         /* Activate FS transceiver. */
         otg->gccfg |= OTG_GCCFG_PWRDWN;
+    } else if (conf_iface == IFACE_HS_EMBEDDED) {
+        /* Disable the FS transceiver, enable the HS transceiver. */
+        otg->gccfg &= ~OTG_GCCFG_PWRDWN;
+        otg->gccfg |= OTG_GCCFG_PHYHSEN;
+        hsphyc_init();
+        core_reset();
     } else {
         ASSERT(0);
     }
@@ -147,6 +178,8 @@ void usb_init(void)
     /* USB_SetDevSpeed */
     if (conf_iface == IFACE_FS) {
         otgd->dcfg = OTG_DCFG_DSPD(3); /* Full Speed */
+    } else if (conf_iface == IFACE_HS_EMBEDDED) {
+        otgd->dcfg = OTG_DCFG_DSPD(1); /* Full Speed */
     } else {
         ASSERT(0);
     }
