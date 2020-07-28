@@ -11,17 +11,58 @@
 
 #include "hw_dwc_otg.h"
 
-static struct {
-    int rx_count;
-    uint32_t rx_data[USB_FS_MPS / 4];
-    bool_t rx_ready, tx_ready;
+static int conf_iface;
+static bool_t is_hs;
+
+static struct rx_buf {
+    uint32_t data[USB_HS_MPS / 4];
+    uint32_t count;
+} rx_buf0[1], rx_bufn[32] section_ext_ram;
+
+#define RX_MASK(_ep, _idx) (((_ep)->_idx) & ((_ep)->rx_nr - 1))
+
+static struct ep {
+    struct rx_buf *rx;
+    uint16_t rxc, rxp, rx_nr;
+    bool_t rx_active, tx_ready;
 } eps[conf_nr_ep];
+
+bool_t hw_has_highspeed(void)
+{
+    return conf_iface == IFACE_HS_EMBEDDED;
+}
+
+bool_t usb_is_highspeed(void)
+{
+    return is_hs;
+}
 
 static void core_reset(void)
 {
     do { delay_us(1); } while (!(otg->grstctl & OTG_GRSTCTL_AHBIDL));
     otg->grstctl |= OTG_GRSTCTL_CSRST;
     do { delay_us(1); } while (otg->grstctl & OTG_GRSTCTL_CSRST);
+}
+
+static void hsphyc_init(void)
+{
+    /* Enable the LDO and wait for it to be ready. */
+    hsphyc->ldo |= HSPHYC_LDO_ENABLE;
+    do { delay_us(1); } while (!(hsphyc->ldo & HSPHYC_LDO_STATUS));
+
+    /* This is correct only for HSE = 16Mhz. */
+    hsphyc->pll1 |= HSPHYC_PLL1_SEL(3);
+
+    /* Magic values from the LL driver. We can probably discard them. */
+    hsphyc->tune |= (HSPHYC_TUNE_HSDRVCHKITRIM(7) |
+                     HSPHYC_TUNE_HSDRVRFRED |
+                     HSPHYC_TUNE_HSDRVDCCUR |
+                     HSPHYC_TUNE_INCURRINT |
+                     HSPHYC_TUNE_INCURREN);
+
+    /* Enable the PLL and wait to stabilise. */
+    hsphyc->pll1 |= HSPHYC_PLL1_EN;
+    delay_ms(2);
 }
 
 static void flush_tx_fifo(int num)
@@ -49,17 +90,29 @@ static bool_t is_high_speed(void)
     return ((otgd->dsts >> 1) & 3) == 0;
 }
 
-static void prepare_rx(uint8_t ep)
+static void prepare_rx(uint8_t epnr)
 {
-    OTG_DOEP doep = &otg_doep[ep];
-    uint16_t len = (ep == 0) ? 64 : (doep->ctl & 0x7ff);
-    uint32_t tsiz = doep->tsiz & 0xe0000000;
+    struct ep *ep = &eps[epnr];
+    OTG_DOEP doep = &otg_doep[epnr];
+    uint16_t mps, nr;
+    uint32_t tsiz;
 
-    tsiz |= OTG_DOEPTSZ_PKTCNT(1);
-    tsiz |= OTG_DOEPTSZ_XFERSIZ(len);
+    if (ep->rx_active)
+        return;
+    nr = ep->rxp - ep->rxc;
+    nr = ep->rx_nr - nr;
+    if (nr <= ep->rx_nr/2)
+        return;
+
+    mps = (epnr == 0) ? EP0_MPS : (doep->ctl & 0x7ff);
+    tsiz = doep->tsiz & 0xe0000000;
+    tsiz |= OTG_DOEPTSZ_PKTCNT(nr);
+    tsiz |= OTG_DOEPTSZ_XFERSIZ(mps * nr);
     doep->tsiz = tsiz;
 
     doep->ctl |= OTG_DOEPCTL_CNAK | OTG_DOEPCTL_EPENA;
+
+    ep->rx_active = TRUE;
 }
 
 static void read_packet(void *p, int len)
@@ -70,17 +123,39 @@ static void read_packet(void *p, int len)
         *_p++ = otg_dfifo[0].x[0];
 }
 
-static void write_packet(const void *p, uint8_t ep, int len)
+static void write_packet(const void *p, uint8_t epnr, int len)
 {
     const uint32_t *_p = p;
     unsigned int n = (len + 3) / 4;
     while (n--)
-        otg_dfifo[ep].x[0] = *_p++;
+        otg_dfifo[epnr].x[0] = *_p++;
+}
+
+static void fifos_init(void)
+{
+    unsigned int i, base, tx_sz, rx_sz, fifo_sz;
+
+    /* F7 OTG: FS 1.25k FIFO RAM, HS 4k FIFO RAM. */
+    fifo_sz = ((conf_port == PORT_FS) ? 0x500 : 0x1000) >> 2;
+    rx_sz = fifo_sz / 2;
+    tx_sz = fifo_sz / (2 * conf_nr_ep);
+
+    otg->grxfsiz = rx_sz;
+
+    base = rx_sz;
+    otg->dieptxf0 = (tx_sz << 16) | base;
+    for (i = 1; i < conf_nr_ep; i++) {
+        base += tx_sz;
+        otg->dieptxf[i-1] = (tx_sz << 16) | base;
+    }
 }
 
 void hw_usb_init(void)
 {
     int i;
+
+    /* Determine which PHY we use based on hardware submodel ID. */
+    conf_iface = board_config->hs_usb ? IFACE_HS_EMBEDDED : IFACE_FS;
 
     /*
      * HAL_PCD_MspInit
@@ -88,6 +163,7 @@ void hw_usb_init(void)
 
     switch (conf_port) {
     case PORT_FS:
+        ASSERT(conf_iface == IFACE_FS);
         gpio_set_af(gpioa, 11, 10);
         gpio_set_af(gpioa, 12, 10);
         gpio_configure_pin(gpioa, 11, AFO_pushpull(IOSPD_HIGH));
@@ -95,11 +171,18 @@ void hw_usb_init(void)
         rcc->ahb2enr |= RCC_AHB2ENR_OTGFSEN;
         break;
     case PORT_HS:
-        gpio_set_af(gpiob, 14, 12);
-        gpio_set_af(gpiob, 15, 12);
-        gpio_configure_pin(gpiob, 14, AFO_pushpull(IOSPD_HIGH));
-        gpio_configure_pin(gpiob, 15, AFO_pushpull(IOSPD_HIGH));
-        rcc->ahb1enr |= RCC_AHB1ENR_OTGHSEN;
+        ASSERT((conf_iface == IFACE_FS) || (conf_iface == IFACE_HS_EMBEDDED));
+        if (conf_iface == IFACE_FS) {
+            gpio_set_af(gpiob, 14, 12);
+            gpio_set_af(gpiob, 15, 12);
+            gpio_configure_pin(gpiob, 14, AFO_pushpull(IOSPD_HIGH));
+            gpio_configure_pin(gpiob, 15, AFO_pushpull(IOSPD_HIGH));
+            rcc->ahb1enr |= RCC_AHB1ENR_OTGHSEN;
+        } else {
+            rcc->ahb1enr |= RCC_AHB1ENR_OTGHSEN;
+            rcc->ahb1enr |= RCC_AHB1ENR_OTGHSULPIEN;
+            rcc->apb2enr |= RCC_APB2ENR_OTGPHYCEN;
+        }
         break;
     default:
         ASSERT(0);
@@ -119,7 +202,11 @@ void hw_usb_init(void)
         /* Activate FS transceiver. */
         otg->gccfg |= OTG_GCCFG_PWRDWN;
     } else {
-        ASSERT(0);
+        /* Disable the FS transceiver, enable the HS transceiver. */
+        otg->gccfg &= ~OTG_GCCFG_PWRDWN;
+        otg->gccfg |= OTG_GCCFG_PHYHSEN;
+        hsphyc_init();
+        core_reset();
     }
 
     /*
@@ -146,9 +233,9 @@ void hw_usb_init(void)
 
     /* USB_SetDevSpeed */
     if (conf_iface == IFACE_FS) {
-        otgd->dcfg = OTG_DCFG_DSPD(3); /* Full Speed */
+        otgd->dcfg = OTG_DCFG_DSPD(DSPD_FULL);
     } else {
-        ASSERT(0);
+        otgd->dcfg = OTG_DCFG_DSPD(DSPD_HIGH);
     }
 
     flush_tx_fifo(0x10);
@@ -181,11 +268,7 @@ void hw_usb_init(void)
                     OTG_GINT_OEPINT |
                     OTG_GINT_RXFLVL);
 
-    /* Set the FIFOs. */
-    otg->grxfsiz = 512 / 4;
-    otg->dieptxf0 = ((128 / 4) << 16) | (512 / 4);
-    for (i = 1; i < conf_nr_ep; i++)
-        otg->dieptxf[i-1] = ((128 / 4) << 16) | ((512+i*128) / 4);
+    fifos_init();
 
     /* HAL_PCD_Start, USB_DevConnect */
     otgd->dctl &= ~OTG_DCTL_SDIS;
@@ -210,75 +293,94 @@ void hw_usb_deinit(void)
     }
 }
 
-int ep_rx_ready(uint8_t ep)
+int ep_rx_ready(uint8_t epnr)
 {
-    return eps[ep].rx_ready ? eps[ep].rx_count : -1;
+    struct ep *ep = &eps[epnr];
+    return (ep->rxc != ep->rxp) ? ep->rx[RX_MASK(ep, rxc)].count : -1;
 }
 
-bool_t ep_tx_ready(uint8_t ep)
+bool_t ep_tx_ready(uint8_t epnr)
 {
-    return eps[ep].tx_ready;
+    return eps[epnr].tx_ready;
 }
 
-void usb_read(uint8_t ep, void *buf, uint32_t len)
+void usb_read(uint8_t epnr, void *buf, uint32_t len)
 {
-    memcpy(buf, eps[ep].rx_data, len);
-    eps[ep].rx_ready = FALSE;
-    prepare_rx(ep);
+    struct ep *ep = &eps[epnr];
+    memcpy(buf, ep->rx[RX_MASK(ep, rxc++)].data, len);
+    prepare_rx(epnr);
 }
 
-void usb_write(uint8_t ep, const void *buf, uint32_t len)
+void usb_write(uint8_t epnr, const void *buf, uint32_t len)
 {
-    OTG_DIEP diep = &otg_diep[ep];
+    OTG_DIEP diep = &otg_diep[epnr];
 
     diep->tsiz = OTG_DIEPTSIZ_PKTCNT(1) | len;
 
 //    if (len != 0)
-//        otgd->diepempmsk |= 1u << ep;
+//        otgd->diepempmsk |= 1u << epnr;
 
     diep->ctl |= OTG_DIEPCTL_CNAK | OTG_DIEPCTL_EPENA;
-    write_packet(buf, ep, len);
-    eps[ep].tx_ready = FALSE;
+    write_packet(buf, epnr, len);
+    eps[epnr].tx_ready = FALSE;
 }
 
-void usb_stall(uint8_t ep)
+void usb_stall(uint8_t epnr)
 {
-    otg_diep[ep].ctl |= OTG_DIEPCTL_STALL;
-    otg_doep[ep].ctl |= OTG_DOEPCTL_STALL;
+    otg_diep[epnr].ctl |= OTG_DIEPCTL_STALL;
+    otg_doep[epnr].ctl |= OTG_DOEPCTL_STALL;
 }
 
-void usb_configure_ep(uint8_t ep, uint8_t type, uint32_t size)
+void usb_configure_ep(uint8_t epnr, uint8_t type, uint32_t size)
 {
-    bool_t in = !!(ep & 0x80);
-    ep &= 0x7f;
+    int i;
+    struct ep *ep;
+    bool_t in = !!(epnr & 0x80);
+
+    epnr &= 0x7f;
+    ep = &eps[epnr];
 
     if (type == EPT_DBLBUF)
         type = EPT_BULK;
 
-    if (in || (ep == 0)) {
-        otgd->daintmsk |= 1u << ep;
-        if (!(otg_diep[ep].ctl & OTG_DIEPCTL_USBAEP)) {
-            otg_diep[ep].ctl |= 
+    if (in || (epnr == 0)) {
+        otgd->daintmsk |= 1u << epnr;
+        if (!(otg_diep[epnr].ctl & OTG_DIEPCTL_USBAEP)) {
+            otg_diep[epnr].ctl |= 
                 OTG_DIEPCTL_MPSIZ(size) |
                 OTG_DIEPCTL_EPTYP(type) |
-                OTG_DIEPCTL_TXFNUM(ep) |
+                OTG_DIEPCTL_TXFNUM(epnr) |
                 OTG_DIEPCTL_SD0PID |
                 OTG_DIEPCTL_USBAEP;
         }
-        eps[ep].tx_ready = TRUE;
+        ep->tx_ready = TRUE;
     }
 
     if (!in) {
-        otgd->daintmsk |= 1u << (ep + 16);
-        if (!(otg_doep[ep].ctl & OTG_DOEPCTL_USBAEP)) {
-            otg_doep[ep].ctl |= 
+        otgd->daintmsk |= 1u << (epnr + 16);
+        if (!(otg_doep[epnr].ctl & OTG_DOEPCTL_USBAEP)) {
+            otg_doep[epnr].ctl |= 
                 OTG_DOEPCTL_MPSIZ(size) |
                 OTG_DOEPCTL_EPTYP(type) |
                 OTG_DIEPCTL_SD0PID |
                 OTG_DOEPCTL_USBAEP;
         }
-        eps[ep].rx_ready = FALSE;
-        prepare_rx(ep);
+        ep->rxc = ep->rxp = 0;
+        if (epnr == 0) {
+            ep->rx = rx_buf0;
+            ep->rx_nr = ARRAY_SIZE(rx_buf0);
+        } else {
+            /* We have one statically-allocated multi-packet buffer. 
+             * Check we aren't trying to map it to multiple endpoints. */
+            ep->rx = NULL;
+            for (i = 0; i < conf_nr_ep; i++)
+                ASSERT(ep->rx != rx_bufn);
+            ep->rx = rx_bufn;
+            ep->rx_nr = ARRAY_SIZE(rx_bufn);
+        }
+        ep->rxc = ep->rxp = 0;
+        ep->rx_active = FALSE;
+        prepare_rx(epnr);
     }
 }
 
@@ -336,51 +438,62 @@ static void handle_rx_transfer(void)
 {
     uint32_t grxsts = otg->grxstsp;
     unsigned int bcnt = OTG_RXSTS_BCNT(grxsts);
-    unsigned int ep = OTG_RXSTS_CHNUM(grxsts);
+    unsigned int epnr = OTG_RXSTS_CHNUM(grxsts);
+    unsigned int rxp;
+    struct ep *ep = &eps[epnr];
+
     switch (OTG_RXSTS_PKTSTS(grxsts)) {
     case STS_SETUP_UPDT:
         bcnt = 8;
     case STS_DATA_UPDT:
-        read_packet(eps[ep].rx_data, bcnt);
-        eps[ep].rx_count = bcnt;
+        ASSERT(ep->rx_active);
+        ASSERT((uint16_t)(ep->rxp - ep->rxc) < ep->rx_nr);
+        rxp = RX_MASK(ep, rxp++);
+        read_packet(ep->rx[rxp].data, bcnt);
+        ep->rx[rxp].count = bcnt;
         break;
     default:
         break;
     }
 }
 
-static void handle_oepint(uint8_t ep)
+static void handle_oepint(uint8_t epnr)
 {
-    uint32_t oepint = otg_doep[ep].intsts & otgd->doepmsk;
+    uint32_t oepint = otg_doep[epnr].intsts & otgd->doepmsk;
+    struct ep *ep = &eps[epnr];
 
-    otg_doep[ep].intsts = oepint;
+    otg_doep[epnr].intsts = oepint;
 
     if (oepint & OTG_DOEPMSK_XFRCM) {
-        eps[ep].rx_ready = TRUE;
-        if (ep == 0)
+        ASSERT(ep->rx_active);
+        ep->rx_active = FALSE;
+        if (epnr == 0)
             handle_rx_ep0(FALSE);
     }
 
     if (oepint & OTG_DOEPMSK_STUPM) {
-        eps[ep].rx_ready = TRUE;
-        if (ep == 0)
+        ASSERT(ep->rx_active);
+        ep->rx_active = FALSE;
+        if (epnr == 0)
             handle_rx_ep0(TRUE);
     }
+
+    prepare_rx(epnr);
 }
 
-static void handle_iepint(uint8_t ep)
+static void handle_iepint(uint8_t epnr)
 {
-    uint32_t iepint = otg_diep[ep].intsts, iepmsk;
+    uint32_t iepint = otg_diep[epnr].intsts, iepmsk;
 
-    iepmsk = otgd->diepmsk | (((otgd->diepempmsk >> ep) & 1) << 7);
-    iepint = otg_diep[ep].intsts & iepmsk;
+    iepmsk = otgd->diepmsk | (((otgd->diepempmsk >> epnr) & 1) << 7);
+    iepint = otg_diep[epnr].intsts & iepmsk;
 
-    otg_diep[ep].intsts = iepint;
+    otg_diep[epnr].intsts = iepint;
 
     if (iepint & OTG_DIEPINT_XFRC) {
-        otgd->diepempmsk &= ~(1 << ep);
-        eps[ep].tx_ready = TRUE;
-        if (ep == 0)
+        otgd->diepempmsk &= ~(1 << epnr);
+        eps[epnr].tx_ready = TRUE;
+        if (epnr == 0)
             handle_tx_ep0();
     }
 
@@ -395,34 +508,34 @@ void usb_process(void)
 
     if (gintsts & OTG_GINT_OEPINT) {
         uint16_t mask = (otgd->daint & otgd->daintmsk) >> 16;
-        int ep;
-        for (ep = 0; mask != 0; mask >>= 1, ep++) {
+        int epnr;
+        for (epnr = 0; mask != 0; mask >>= 1, epnr++) {
             if (mask & 1)
-                handle_oepint(ep);
+                handle_oepint(epnr);
         }
     }
 
     if (gintsts & OTG_GINT_IEPINT) {
         uint16_t mask = otgd->daint & otgd->daintmsk;
-        int ep;
-        for (ep = 0; mask != 0; mask >>= 1, ep++) {
+        int epnr;
+        for (epnr = 0; mask != 0; mask >>= 1, epnr++) {
             if (mask & 1)
-                handle_iepint(ep);
+                handle_iepint(epnr);
         }
     }
 
     if (gintsts & OTG_GINT_ENUMDNE) {
-        bool_t hs;
-        printk("[ENUMDNE]\n");
         /* USB_ActivateSetup */
         otg_diep[0].ctl &= ~OTG_DIEPCTL_MPSIZ(0x7ff);
         otgd->dctl |= OTG_DCTL_CGINAK;
         /* USB_SetTurnaroundTime */
-        hs = is_high_speed();
+        is_hs = is_high_speed();
+        usb_bulk_mps = is_hs ? USB_HS_MPS : USB_FS_MPS;
         /* Ref. Table 232, FS Mode */
-        otg->gusbcfg |= OTG_GUSBCFG_TRDT(hs ? 9 : 6);
-        usb_configure_ep(0, EPT_CONTROL, USB_FS_MPS);
+        otg->gusbcfg |= OTG_GUSBCFG_TRDT(is_hs ? 9 : 6);
+        usb_configure_ep(0, EPT_CONTROL, EP0_MPS);
         otg->gintsts = OTG_GINT_ENUMDNE;
+        printk("[ENUMDNE: %cS]\n", is_hs ? 'H' : 'F');
     }
 
     if (gintsts & OTG_GINT_USBRST) {

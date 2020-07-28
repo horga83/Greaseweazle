@@ -44,9 +44,9 @@ static const struct gw_delay factory_delay_params = {
 };
 
 #if STM32F == 1
-#include "floppy_f1.c"
+#include "f1/floppy.c"
 #elif STM32F == 7
-#include "floppy_f7.c"
+#include "f7/floppy.c"
 #endif
 
 static struct index {
@@ -86,12 +86,11 @@ static enum {
     ST_erase_flux,
     ST_source_bytes,
     ST_sink_bytes,
+    ST_update_bootloader,
 } floppy_state = ST_inactive;
 
-/* We sometimes cast u_buf to uint32_t[], hence the alignment constraint. */
-static uint8_t u_buf[8192] aligned(4);
 static uint32_t u_cons, u_prod;
-#define U_MASK(x) ((x)&(sizeof(u_buf)-1))
+#define U_MASK(x) ((x)&(U_BUF_SZ-1))
 
 static void step_one_out(void)
 {
@@ -222,7 +221,6 @@ void floppy_init(void)
     floppy_mcu_init();
 
     /* Output pins, unbuffered. */
-    configure_pin(densel, GPO_bus);
     configure_pin(dir,    GPO_bus);
     configure_pin(step,   GPO_bus);
     configure_pin(wgate,  GPO_bus);
@@ -245,10 +243,10 @@ void floppy_init(void)
     _set_bus_type(BUS_NONE);
 }
 
-static struct gw_info gw_info = {
+struct gw_info gw_info = {
     .max_index = 15, .max_cmd = CMD_MAX,
     .sample_freq = 72000000u,
-    .hw_type = STM32F
+    .hw_model = STM32F
 };
 
 static void auto_off_arm(void)
@@ -264,7 +262,7 @@ static void floppy_end_command(void *ack, unsigned int ack_len)
     u_cons = u_prod = 0;
     if (floppy_state == ST_command_wait)
         act_led(FALSE);
-    if (ack_len == USB_FS_MPS) {
+    if (ack_len == usb_bulk_mps) {
         ASSERT(floppy_state == ST_command_wait);
         floppy_state = ST_zlp;
     }
@@ -289,7 +287,7 @@ static struct {
     int ticks_since_index;
     uint32_t ticks_since_flux;
     uint32_t index_ticks[15];
-    uint8_t packet[USB_FS_MPS];
+    uint8_t packet[USB_HS_MPS];
 } rw;
 
 static void rdata_encode_flux(void)
@@ -401,7 +399,7 @@ static uint8_t floppy_read_prep(const struct gw_read_flux *rf)
 static void make_read_packet(unsigned int n)
 {
     unsigned int c = U_MASK(u_cons);
-    unsigned int l = ARRAY_SIZE(u_buf) - c;
+    unsigned int l = U_BUF_SZ - c;
     if (l < n) {
         memcpy(rw.packet, &u_buf[c], l);
         memcpy(&rw.packet[l], u_buf, n-l);
@@ -421,7 +419,7 @@ static void floppy_read(void)
         rdata_encode_flux();
         avail = (uint32_t)(u_prod - u_cons);
 
-        if (avail > sizeof(u_buf)) {
+        if (avail > U_BUF_SZ) {
 
             /* Overflow */
             printk("OVERFLOW %u %u %u %u\n", u_cons, u_prod,
@@ -449,12 +447,12 @@ static void floppy_read(void)
 
         }
 
-    } else if ((avail < USB_FS_MPS)
+    } else if ((avail < usb_bulk_mps)
                && !rw.packet_ready
                && ep_tx_ready(EP_TX)) {
 
         /* Final packet, including ACK byte (NUL). */
-        memset(rw.packet, 0, USB_FS_MPS);
+        memset(rw.packet, 0, usb_bulk_mps);
         make_read_packet(avail);
         floppy_state = ST_command_wait;
         floppy_end_command(rw.packet, avail+1);
@@ -462,11 +460,11 @@ static void floppy_read(void)
 
     }
 
-    if (!rw.packet_ready && (avail >= USB_FS_MPS))
-        make_read_packet(USB_FS_MPS);
+    if (!rw.packet_ready && (avail >= usb_bulk_mps))
+        make_read_packet(usb_bulk_mps);
 
     if (rw.packet_ready && ep_tx_ready(EP_TX)) {
-        usb_write(EP_TX, rw.packet, USB_FS_MPS);
+        usb_write(EP_TX, rw.packet, usb_bulk_mps);
         rw.packet_ready = FALSE;
     }
 }
@@ -573,11 +571,11 @@ static void floppy_process_write_packet(void)
     }
 
     if (rw.packet_ready) {
-        unsigned int avail = ARRAY_SIZE(u_buf) - (uint32_t)(u_prod - u_cons);
+        unsigned int avail = U_BUF_SZ - (uint32_t)(u_prod - u_cons);
         unsigned int n = rw.packet_len;
         if (avail >= n) {
             unsigned int p = U_MASK(u_prod);
-            unsigned int l = ARRAY_SIZE(u_buf) - p;
+            unsigned int l = U_BUF_SZ - p;
             if (l < n) {
                 memcpy(&u_buf[p], rw.packet, l);
                 memcpy(u_buf, &rw.packet[l], n-l);
@@ -617,9 +615,14 @@ static uint8_t floppy_write_prep(const struct gw_write_flux *wf)
 static void floppy_write_wait_data(void)
 {
     bool_t write_finished;
+    unsigned int u_buf_threshold;
 
     floppy_process_write_packet();
     wdata_decode_flux();
+
+    /* We don't wait for the massive F7 u_buf[] to fill at Full Speed. */
+    u_buf_threshold = ((U_BUF_SZ > 16384) && !usb_is_highspeed())
+        ? 16384 - 512 : U_BUF_SZ - 512;
 
     /* Wait for DMA and input buffers to fill, or write stream to end. We must
      * take care because, since we are not yet draining the DMA buffer, the
@@ -629,7 +632,7 @@ static void floppy_write_wait_data(void)
                       ? rw.write_finished
                       : (u_buf[U_MASK(u_prod-1)] == 0));
     if (((dma.prod != (ARRAY_SIZE(dma.buf)-1)) 
-         || ((uint32_t)(u_prod - u_cons) < (ARRAY_SIZE(u_buf) - 512)))
+         || ((uint32_t)(u_prod - u_cons) < u_buf_threshold))
         && !write_finished)
         return;
 
@@ -805,9 +808,9 @@ static void ss_update_deltas(int len)
             continue;
         delta = time_diff(u_times[U_MASK(p)>>2], now);
         u_times[U_MASK(p)>>2] = now;
-        if ((delta > ss.max_delta) && (p >= sizeof(u_buf)))
+        if ((delta > ss.max_delta) && (p >= U_BUF_SZ))
             ss.max_delta = delta;
-        if ((delta < ss.min_delta) && (p >= sizeof(u_buf)))
+        if ((delta < ss.min_delta) && (p >= U_BUF_SZ))
             ss.min_delta = delta;
     }
 
@@ -819,15 +822,15 @@ static void source_bytes(void)
     if (!ep_tx_ready(EP_TX))
         return;
 
-    if (ss.todo < USB_FS_MPS) {
+    if (ss.todo < usb_bulk_mps) {
         floppy_state = ST_command_wait;
         floppy_end_command(rw.packet, ss.todo);
         return; /* FINISHED */
     }
 
-    usb_write(EP_TX, rw.packet, USB_FS_MPS);
-    ss.todo -= USB_FS_MPS;
-    ss_update_deltas(USB_FS_MPS);
+    usb_write(EP_TX, rw.packet, usb_bulk_mps);
+    ss.todo -= usb_bulk_mps;
+    ss_update_deltas(usb_bulk_mps);
 }
 
 static void sink_bytes(void)
@@ -856,6 +859,65 @@ static void sink_bytes(void)
 }
 
 
+/*
+ * BOOTLOADER UPDATE
+ */
+
+#define BL_START 0x08000000
+#define BL_END   ((uint32_t)_stext)
+#define BL_SIZE  (BL_END - BL_START)
+
+static struct {
+    uint32_t len;
+    uint32_t cur;
+} update;
+
+static void erase_old_bootloader(void)
+{
+    uint32_t p;
+    for (p = BL_START; p < BL_END; p += FLASH_PAGE_SIZE)
+        fpec_page_erase(p);
+}
+
+static void update_prep(uint32_t len)
+{
+    fpec_init();
+    erase_old_bootloader();
+
+    floppy_state = ST_update_bootloader;
+    update.cur = 0;
+    update.len = len;
+
+    printk("Update Bootloader: %u bytes\n", len);
+}
+
+static void update_continue(void)
+{
+    int len;
+
+    if ((len = ep_rx_ready(EP_RX)) >= 0) {
+        usb_read(EP_RX, &u_buf[u_prod], len);
+        u_prod += len;
+    }
+
+    if ((len = u_prod) >= 2) {
+        int nr = len & ~1;
+        fpec_write(u_buf, nr, BL_START + update.cur);
+        update.cur += nr;
+        u_prod -= nr;
+        memcpy(u_buf, &u_buf[nr], u_prod);
+    }
+
+    if ((update.cur >= update.len) && ep_tx_ready(EP_TX)) {
+        uint16_t crc = crc16_ccitt((void *)BL_START, update.len, 0xffff);
+        printk("Final CRC: %04x (%s)\n", crc, crc ? "FAIL" : "OK");
+        u_buf[0] = !!crc;
+        floppy_state = ST_command_wait;
+        floppy_end_command(u_buf, 1);
+    }
+}
+
+
 static void process_command(void)
 {
     uint8_t cmd = u_buf[0];
@@ -879,9 +941,9 @@ static void process_command(void)
             break;
         case GETINFO_BW_STATS: /* gw_bw_stats */ {
             struct gw_bw_stats bw;
-            bw.min_bw.bytes = sizeof(u_buf);
+            bw.min_bw.bytes = U_BUF_SZ;
             bw.min_bw.usecs = ss.max_delta / time_us(1);
-            bw.max_bw.bytes = sizeof(u_buf);
+            bw.max_bw.bytes = U_BUF_SZ;
             bw.max_bw.usecs = ss.min_delta / time_us(1);
             memcpy(&u_buf[2], &bw, sizeof(bw));
             break;
@@ -890,6 +952,16 @@ static void process_command(void)
             goto bad_command;
         }
         resp_sz += 32;
+        break;
+    }
+    case CMD_UPDATE: {
+        uint32_t u_len = *(uint32_t *)&u_buf[2];
+        uint32_t signature = *(uint32_t *)&u_buf[6];
+        if (len != 10) goto bad_command;
+        if (u_len & 3) goto bad_command;
+        if (u_len > BL_SIZE) goto bad_command;
+        if (signature != 0xdeafbee3) goto bad_command;
+        update_prep(u_len);
         break;
     }
     case CMD_SEEK: {
@@ -985,19 +1057,15 @@ static void process_command(void)
         uint8_t level = u_buf[3];
         if ((len != 4) || (level & ~1))
             goto bad_command;
-        if (pin != 2) {
-            u_buf[1] = ACK_BAD_PIN;
-            goto out;
-        }
-        gpio_write_pin(gpio_densel, pin_densel, level);
-        break;
+        u_buf[1] = set_user_pin(pin, level);
+        goto out;
     }
     case CMD_RESET: {
         if (len != 2)
             goto bad_command;
         delay_params = factory_delay_params;
         _set_bus_type(BUS_NONE);
-        write_pin(densel, FALSE);
+        reset_user_pins();
         break;
     }
     case CMD_ERASE_FLUX: {
@@ -1019,6 +1087,7 @@ static void process_command(void)
         sink_source_prep(&ssb);
         break;
     }
+#if STM32F == 7
     case CMD_SWITCH_FW_MODE: {
         uint8_t mode = u_buf[2];
         if ((len != 3) || (mode & ~1))
@@ -1028,10 +1097,12 @@ static void process_command(void)
             delay_ms(500);
             /* Poke a flag in SRAM1, picked up by the bootloader. */
             *(volatile uint32_t *)0x20010000 = 0xdeadbeef;
+            dcache_disable();
             system_reset();
         }
         break;
     }
+#endif
     default:
         goto bad_command;
     }
@@ -1074,7 +1145,7 @@ void floppy_process(void)
     case ST_command_wait:
 
         len = ep_rx_ready(EP_RX);
-        if ((len >= 0) && (len < (sizeof(u_buf)-u_prod))) {
+        if ((len >= 0) && (len < (U_BUF_SZ-u_prod))) {
             usb_read(EP_RX, &u_buf[u_prod], len);
             u_prod += len;
         }
@@ -1123,6 +1194,10 @@ void floppy_process(void)
 
     case ST_sink_bytes:
         sink_bytes();
+        break;
+
+    case ST_update_bootloader:
+        update_continue();
         break;
 
     default:

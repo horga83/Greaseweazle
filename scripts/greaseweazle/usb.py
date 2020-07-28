@@ -137,12 +137,13 @@ class Unit:
         self.reset()
         # Copy firmware info to instance variables (see above for definitions).
         self._send_cmd(struct.pack("3B", Cmd.GetInfo, 3, GetInfo.Firmware))
-        x = struct.unpack("<4BIH22x", self.ser.read(32))
+        x = struct.unpack("<4BI3B21x", self.ser.read(32))
         (self.major, self.minor, self.max_index,
-         self.max_cmd, self.sample_freq, self.hw_type) = x
+         self.max_cmd, self.sample_freq, self.hw_model,
+         self.hw_submodel, self.usb_speed) = x
         # Old firmware doesn't report HW type but runs on STM32F1 only.
-        if self.hw_type == 0:
-            self.hw_type = 1
+        if self.hw_model == 0:
+            self.hw_model = 1
         # Check whether firmware is in update mode: limited command set if so.
         self.update_mode = (self.max_index == 0)
         if self.update_mode:
@@ -245,6 +246,16 @@ class Unit:
     ## Update Greaseweazle to the given new firmware.
     def update_firmware(self, dat):
         self._send_cmd(struct.pack("<2BI", Cmd.Update, 6, len(dat)))
+        self.ser.write(dat)
+        (ack,) = struct.unpack("B", self.ser.read(1))
+        return ack
+
+
+    ## update_bootloader:
+    ## Update Greaseweazle with the given new bootloader.
+    def update_bootloader(self, dat):
+        self._send_cmd(struct.pack("<2B2I", Cmd.Update, 10,
+                                   len(dat), 0xdeafbee3))
         self.ser.write(dat)
         (ack,) = struct.unpack("B", self.ser.read(1))
         return ack
@@ -360,7 +371,7 @@ class Unit:
 
     ## write_track:
     ## Write the given flux stream to the current track via Greaseweazle.
-    def write_track(self, flux_list, nr_retries=5):
+    def write_track(self, flux_list, terminate_at_index, nr_retries=5):
 
         # Create encoded data stream.
         dat = self._encode_flux(flux_list)
@@ -369,7 +380,8 @@ class Unit:
         while True:
             try:
                 # Write the flux stream to the track via Greaseweazle.
-                self._send_cmd(struct.pack("3B", Cmd.WriteFlux, 3, 1))
+                self._send_cmd(struct.pack("3B", Cmd.WriteFlux, 3,
+                                           int(terminate_at_index)))
                 self.ser.write(dat)
                 self.ser.read(1) # Sync with Greaseweazle
                 self._send_cmd(struct.pack("2B", Cmd.GetFluxStatus, 2))

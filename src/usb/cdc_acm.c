@@ -108,12 +108,14 @@ bool_t cdc_acm_set_configuration(void)
     bulk_type = EPT_BULK;
 #endif
 
+    gw_info.usb_speed = usb_is_highspeed() ? 1 : 0;
+
     /* Notification Element (D->H) */
     usb_configure_ep(0x81, EPT_INTERRUPT, 0);
     /* Bulk Pipe (H->D) */
-    usb_configure_ep(0x02, bulk_type, USB_FS_MPS);
+    usb_configure_ep(0x02, bulk_type, usb_bulk_mps);
     /* Bulk Pipe (D->H) */
-    usb_configure_ep(0x83, bulk_type, USB_FS_MPS);
+    usb_configure_ep(0x83, bulk_type, usb_bulk_mps);
 
     usb_cdc_acm_ops.configure();
 

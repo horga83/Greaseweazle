@@ -9,7 +9,7 @@ import os, sys
 import platform
 import ctypes as ct
 from bitarray import bitarray
-from greaseweazle.flux import Flux
+from greaseweazle.track import MasterTrack
 from greaseweazle import error
 
 class CapsDateTimeExt(ct.Structure):
@@ -175,25 +175,24 @@ class IPF:
         trackbuf.frombytes(bytes(carray))
         trackbuf = trackbuf[:ti.tracklen]
 
-        # Write splice is at trackbuf[ti.overlap]. Index is at trackbuf[0].
-        #for i in range(ti.sectorcnt):
-        #    si = CapsSectorInfo()
-        #    res = self.lib.CAPSGetInfo(ct.byref(si), self.iid,
-        #                               cyl, head, 1, i)
-        #    error.check(res == 0, "Couldn't get sector info")
-        #    # Data is at trackbuf[si.datastart:si.datastart + si.datasize]
-        #for i in range(ti.weakcnt):
-        #    wi = CapsDataInfo()
-        #    res = self.lib.CAPSGetInfo(ct.byref(wi), self.iid,
-        #                               cyl, head, 2, i)
-        #    error.check(res == 0, "Couldn't get weak data info")
-        #    # Weak data at trackbuf[wi.start:wi.start + wi.size]
+        data = []
+        for i in range(ti.sectorcnt):
+            si = CapsSectorInfo()
+            res = self.lib.CAPSGetInfo(ct.byref(si), self.iid,
+                                       cyl, head, 1, i)
+            error.check(res == 0, "Couldn't get sector info")
+            # Adjust the range start to be splice- rather than index-relative
+            data.append(((si.datastart - ti.overlap) % ti.tracklen,
+                         si.datasize))
 
-        error.check(ti.weakcnt == 0, "Can't yet handle weak data")
-
-        # We don't really have access to the bitrate. It depends on RPM.
-        # So we assume a rotation rate of 300 RPM (5 rev/sec).
-        bitrate = ti.tracklen * 5
+        weak = []
+        for i in range(ti.weakcnt):
+            wi = CapsDataInfo()
+            res = self.lib.CAPSGetInfo(ct.byref(wi), self.iid,
+                                       cyl, head, 2, i)
+            error.check(res == 0, "Couldn't get weak data info")
+            # Adjust the range start to be splice- rather than index-relative
+            weak.append(((wi.start - ti.overlap) % ti.tracklen, wi.size))
 
         timebuf = None
         if ti.timebuf:
@@ -211,13 +210,23 @@ class IPF:
             # Clip the timing info, if necessary.
             timebuf = timebuf[:ti.tracklen]
 
-        # TODO: Place overlap (write splice) at the correct position.
-        if ti.overlap != 0:
+        # Rotate the track to start at the splice rather than the index.
+        if ti.overlap:
             trackbuf = trackbuf[ti.overlap:] + trackbuf[:ti.overlap]
             if timebuf:
                 timebuf = timebuf[ti.overlap:] + timebuf[:ti.overlap]
-
-        return Flux.from_bitarray(trackbuf, bitrate, timebuf)
+            
+        # We don't really have access to the bitrate. It depends on RPM.
+        # So we assume a rotation rate of 300 RPM (5 rev/sec).
+        rpm = 300
+                
+        track = MasterTrack(
+            bits = trackbuf,
+            time_per_rev = 60/rpm,
+            bit_ticks = timebuf,
+            splice = ti.overlap,
+            weak = weak)
+        return track
 
 
 # Open and initialise the CAPS library.

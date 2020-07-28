@@ -19,6 +19,9 @@
 /* [BOOTLOADER] CMD_UPDATE, length=6, <update_len>. 
  * Host follows with <update_len> bytes.
  * Bootloader finally returns a status byte, 0 on success. */
+/* [MAIN FIRMWARE] CMD_UPDATE, length=10, <update_len>, 0xdeafbee3.
+ * Host follows with <update_len> bytes.
+ * Main firmware finally returns a status byte, 0 on success. */
 #define CMD_UPDATE          1
 /* CMD_SEEK, length=3, cyl#. Seek to cyl# on selected drive. */
 #define CMD_SEEK            2
@@ -107,8 +110,10 @@ struct packed gw_info {
     uint8_t max_index;
     uint8_t max_cmd;
     uint32_t sample_freq;
-    uint16_t hw_type;
+    uint8_t hw_model, hw_submodel;
+    uint8_t usb_speed;
 };
+extern struct gw_info gw_info;
 
 /* CMD_GET_INFO, index 1 */
 #define GETINFO_BW_STATS 1

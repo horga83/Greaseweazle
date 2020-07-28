@@ -9,7 +9,11 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
+#define CORTEX_M7 1
+
 /* C pointer types */
+#define CPUFEAT volatile struct cpufeat * const
+#define CACHE volatile struct cache * const
 #define SYSCFG volatile struct syscfg * const
 #define DMA_STR volatile struct dma_str * const
 #define HSPHYC volatile struct hsphyc * const
@@ -19,6 +23,8 @@ static STK stk = (struct stk *)STK_BASE;
 static SCB scb = (struct scb *)SCB_BASE;
 static NVIC nvic = (struct nvic *)NVIC_BASE;
 static DBG dbg = (struct dbg *)DBG_BASE;
+static CPUFEAT cpufeat = (struct cpufeat *)CPUFEAT_BASE;
+static CACHE cache = (struct cache *)CACHE_BASE;
 static FLASH flash = (struct flash *)FLASH_BASE;
 static PWR pwr = (struct pwr *)PWR_BASE;
 static RCC rcc = (struct rcc *)RCC_BASE;
@@ -79,6 +85,34 @@ static SER_ID ser_id = (uint32_t *)0x1ff07a10;
 void peripheral_clock_delay(void);
 
 void gpio_set_af(GPIO gpio, unsigned int pin, unsigned int af);
+
+#define section_ext_ram __attribute__((section(".ext_ram")))
+
+enum {
+    F7SM_basic_v1 = 0,
+    F7SM_ant_goffart_f7_plus_v1,
+    F7SM_lightning,
+    F7SM_basic_v2,
+    F7SM_ant_goffart_f7_plus_v2,
+};
+
+struct user_pin {
+    uint8_t pin_id;
+    uint8_t gpio_bank;
+    uint8_t gpio_pin;
+    bool_t  push_pull;
+};
+
+struct board_config {
+    uint8_t hse_mhz;
+    bool_t hs_usb;
+    const struct user_pin *user_pins;
+};
+
+extern const struct board_config *board_config;
+void identify_board_config(void);
+
+GPIO gpio_from_id(uint8_t id);
 
 /*
  * Local variables:

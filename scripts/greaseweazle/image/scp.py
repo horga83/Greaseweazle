@@ -5,10 +5,17 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
-import struct
+import struct, functools
 
 from greaseweazle import error
 from greaseweazle.flux import Flux
+
+class SCPOpts:
+    """legacy_ss: Set to True to generate (incorrect) legacy single-sided
+    SCP image.
+    """
+    def __init__(self):
+        self.legacy_ss = False
 
 class SCP:
 
@@ -16,59 +23,101 @@ class SCP:
     sample_freq = 40000000
 
     def __init__(self, start_cyl, nr_sides):
-        self.start_cyl = start_cyl
+        self.opts = SCPOpts()
         self.nr_sides = nr_sides
         self.nr_revs = None
-        self.track_list = []
+        self.track_list = [(None,None)] * (start_cyl*2)
 
 
     @classmethod
     def to_file(cls, start_cyl, nr_sides):
-        hfe = cls(start_cyl, nr_sides)
-        return hfe
+        scp = cls(start_cyl, nr_sides)
+        return scp
 
 
     @classmethod
     def from_file(cls, dat):
 
         header = struct.unpack("<3s9BI", dat[0:16])
-        (sig, _, _, nr_revs, s_trk, e_trk, flags, _, ss, _, _) = header
+        (sig, _, _, nr_revs, _, _, flags, _, single_sided, _, _) = header
         error.check(sig == b"SCP", "SCP: Bad signature")
-        nr_sides = 1 if ss else 2
-        
-        trk_offs = struct.unpack("<168I", dat[16:0x2b0])
 
-        scp = cls(s_trk // nr_sides, nr_sides)
+        index_cued = flags & 1 or nr_revs == 1
+        if not index_cued:
+            nr_revs -= 1
+        
+        # Some tools generate a short TLUT. We handle this by truncating the
+        # TLUT at the first Track Data Header.
+        trk_offs = struct.unpack("<168I", dat[16:0x2b0])
+        for i in range(168):
+            try:
+                off = trk_offs[i]
+            except IndexError:
+                break
+            if off == 0 or off >= 0x2b0:
+                continue
+            off = off//4 - 4
+            error.check(off >= 0, "SCP: Bad Track Table")
+            trk_offs = trk_offs[:off]
+
+        scp = cls(0, 2)
         scp.nr_revs = nr_revs
 
-        for trknr in range(s_trk, e_trk+1):
+        for trknr in range(len(trk_offs)):
+            
             trk_off = trk_offs[trknr]
             if trk_off == 0:
                 scp.track_list.append((None, None))
+                continue
 
             # Parse the SCP track header and extract the flux data.
             thdr = dat[trk_off:trk_off+4+12*nr_revs]
-            sig, tnr, _, _, s_off = struct.unpack("<3sB3I", thdr[:16])
+            sig, tnr = struct.unpack("<3sB", thdr[:4])
             error.check(sig == b"TRK", "SCP: Missing track signature")
             error.check(tnr == trknr, "SCP: Wrong track number in header")
+            _off = 12 if index_cued else 24 # skip first partial rev
+            s_off, = struct.unpack("<I", thdr[_off:_off+4])
             _, e_nr, e_off = struct.unpack("<3I", thdr[-12:])
-            tdat = dat[trk_off+s_off:trk_off+e_off+e_nr*2]
 
-            scp.track_list.append((thdr, tdat))
+            e_off += e_nr*2
+            if s_off == e_off:
+                # FluxEngine creates dummy TDHs for empty tracks.
+                # Bail on them here.
+                scp.track_list.append((None, None))
+                continue
+                
+            tdat = dat[trk_off+s_off:trk_off+e_off]
+            scp.track_list.append((thdr[4:], tdat))
 
+        # s[side] is True iff there are non-empty tracks on @side
+        s = []
+        for i in range(2):
+            s.append(functools.reduce(lambda x, y: x or (y[1] is not None),
+                                      scp.track_list[i::2], False))
+            
+        # Some tools produce (or used to produce) single-sided images using
+        # consecutive entries in the TLUT. This needs fixing up.
+        if single_sided and functools.reduce(lambda x, y: x and y, s):
+            new_list = []
+            for t in scp.track_list[:84]:
+                if single_sided != 1: # Side 1
+                    new_list.append((None, None))
+                new_list.append(t)
+                if single_sided == 1: # Side 0
+                    new_list.append((None, None))
+            scp.track_list = new_list
+            print('SCP: Imported legacy single-sided image')
+            
         return scp
 
 
     def get_track(self, cyl, side, writeout=False):
-        if side >= self.nr_sides or cyl < self.start_cyl:
-            return None
-        off = (cyl - self.start_cyl) * self.nr_sides + side
+        off = cyl*2 + side
         if off >= len(self.track_list):
             return None
         tdh, dat = self.track_list[off]
-        if not dat:
+        if dat is None:
             return None
-        tdh = tdh[4:]
 
         # Writeout requires only a single revolution
         if writeout:
@@ -94,12 +143,17 @@ class SCP:
             val = 0
 
         return Flux(index_list, flux_list, SCP.sample_freq)
-    
-        
-    # append_track:
-    # Converts a Flux object into a Supercard Pro Track and appends it to
-    # the current image-in-progress.
+
+
     def append_track(self, flux):
+        """Converts a Flux object into a Supercard Pro Track and appends it to
+        the current image-in-progress.
+        """
+
+        def _append(self, tdh, dat):
+            self.track_list.append((tdh, dat))
+            if self.nr_sides == 1:
+                self.track_list.append((None, None))
 
         nr_revs = len(flux.index_list)
         if not self.nr_revs:
@@ -109,10 +163,7 @@ class SCP:
         
         factor = SCP.sample_freq / flux.sample_freq
 
-        trknr = self.start_cyl * self.nr_sides + len(self.track_list)
-        tdh = struct.pack("<3sB", b"TRK", trknr)
-        dat = bytearray()
-
+        tdh, dat = bytearray(), bytearray()
         len_at_index = rev = 0
         to_index = flux.index_list[0]
         rem = 0.0
@@ -131,7 +182,7 @@ class SCP:
                 rev += 1
                 if rev >= nr_revs:
                     # We're done: We simply discard any surplus flux samples
-                    self.track_list.append((tdh, dat))
+                    _append(self, tdh, dat)
                     return
                 to_index += flux.index_list[rev]
 
@@ -158,18 +209,25 @@ class SCP:
             len_at_index = len(dat)
             rev += 1
 
-        self.track_list.append((tdh, dat))
+        _append(self, tdh, dat)
 
 
     def get_image(self):
-        s_trk = self.start_cyl * self.nr_sides
-        e_trk = s_trk + len(self.track_list) - 1
+        single_sided = 1 if self.nr_sides == 1 else 0
+        track_list = self.track_list
+        if single_sided and self.opts.legacy_ss:
+            print('SCP: Generated legacy single-sided image')
+            track_list = track_list[::2]
         # Generate the TLUT and concatenate all the tracks together.
-        trk_offs = bytearray(s_trk * 4)
+        trk_offs = bytearray()
         trk_dat = bytearray()
-        for tdh, dat in self.track_list:
-            trk_offs += struct.pack("<I", 0x2b0 + len(trk_dat))
-            trk_dat += tdh + dat
+        for trknr in range(len(track_list)):
+            tdh, dat = track_list[trknr]
+            if dat is None:
+                trk_offs += struct.pack("<I", 0)
+            else:
+                trk_offs += struct.pack("<I", 0x2b0 + len(trk_dat))
+                trk_dat += struct.pack("<3sB", b"TRK", trknr) + tdh + dat
         trk_offs += bytes(0x2a0 - len(trk_offs))
         # Calculate checksum over all data (except 16-byte image header).
         csum = 0
@@ -182,10 +240,10 @@ class SCP:
                              b"SCP",    # Signature
                              0,         # Version
                              0x80,      # DiskType = Other
-                             self.nr_revs, s_trk, e_trk,
-                             0x01,      # Flags = Index
+                             self.nr_revs, 0, len(track_list) - 1,
+                             0x03,      # Flags = Index, 96TPI
                              0,         # 16-bit cell width
-                             1 if self.nr_sides == 1 else 0,
+                             single_sided,
                              0,         # 25ns capture
                              csum & 0xffffffff)
         # Concatenate it all together and send it back.

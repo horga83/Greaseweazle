@@ -7,7 +7,9 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
-import sys, argparse, serial, struct, os
+description = "Update the Greaseweazle device firmware to current version."
+
+import sys, serial, struct, os
 import crcmod.predefined
 
 from greaseweazle.tools import util
@@ -18,8 +20,10 @@ from greaseweazle import usb as USB
 # Updates the Greaseweazle firmware using the specified Update File.
 def update_firmware(usb, args):
 
+    req_type = b'BL' if args.bootloader else b'GW'
+
     filename = args.file
-    if filename == "auto":
+    if filename is None:
         # Get the absolute path to the root Greaseweazle folder.
         path = os.path.dirname(os.path.abspath(__file__))
         for _ in range(3):
@@ -28,14 +32,25 @@ def update_firmware(usb, args):
         filename = os.path.join(path, "Greaseweazle-v%d.%d.upd"
                                 % (version.major, version.minor))
     
-    # Read the entire update catalogue.
+    # Read and verify the entire update catalogue.
     with open(filename, "rb") as f:
         dat = f.read()
+    if struct.unpack('4s', dat[:4])[0] != b'GWUP':
+        print('%s: Not a valid UPD file' % (filename))
+        return
+    crc32 = crcmod.predefined.Crc('crc-32-mpeg')
+    crc32.update(dat)
+    if crc32.crcValue != 0:
+        print('%s: UPD file is corrupt' % (filename))
+        return
+    dat = dat[4:-4]
 
     # Search the catalogue for a match on our Weazle's hardware type.
     while dat:
-        upd_len, hw_type = struct.unpack("<2H", dat[:4])
-        if hw_type == usb.hw_type:
+        upd_len, hw_model = struct.unpack("<2H", dat[:4])
+        upd_type, major, minor = struct.unpack("2s2B", dat[upd_len-4:upd_len])
+        if ((hw_model, upd_type, major, minor)
+            == (usb.hw_model, req_type, version.major, version.minor)):
             # Match: Pull out the embedded update file.
             dat = dat[4:upd_len+4]
             break
@@ -43,12 +58,15 @@ def update_firmware(usb, args):
         dat = dat[upd_len+4:]
 
     if not dat:
-        print("%s: No match for hardware type %x" % (filename, usb.hw_type))
+        print("%s: F%u v%u.%u %s update not found"
+              % (filename, usb.hw_model,
+                 version.major, version.minor,
+                 'bootloader' if args.bootloader else 'firmware'))
         return
 
     # Check the matching update file's footer.
-    sig, maj, min, hw_type = struct.unpack("<2s2BH", dat[-8:-2])
-    if len(dat) & 3 != 0 or sig != b'GW' or hw_type != usb.hw_type:
+    sig, maj, min, hw_model = struct.unpack("<2s2BH", dat[-8:-2])
+    if len(dat) & 3 != 0 or sig != req_type or hw_model != usb.hw_model:
         print("%s: Bad update file" % (filename))
         return
     crc16 = crcmod.predefined.Crc('crc-ccitt-false')
@@ -58,33 +76,42 @@ def update_firmware(usb, args):
         return
 
     # Perform the update.
-    print("Updating to v%u.%u..." % (maj, min))
-    ack = usb.update_firmware(dat)
-    if ack != 0:
-        print("** UPDATE FAILED: Please retry!")
-        return
-    print("Done.")
-    
-    if usb.hw_type == 7:
-        util.usb_reopen(usb, is_update=False)
+    print("Updating %s to v%u.%u..."
+          % ("Bootloader" if args.bootloader else "Main Firmware", maj, min))
+    if args.bootloader:
+        ack = usb.update_bootloader(dat)
+        if ack != 0:
+            print("""\
+** UPDATE FAILED: Please retry immediately or your Weazle may need
+        full reflashing via a suitable programming adapter!""")
+            return
+        print("Done.")
     else:
-        print("** Disconnect Greaseweazle and remove the Programming Jumper.")
+        ack = usb.update_firmware(dat)
+        if ack != 0:
+            print("** UPDATE FAILED: Please retry!")
+            return
+        print("Done.")
+    
+        if usb.hw_model == 7:
+            util.usb_reopen(usb, is_update=False)
+        else:
+            print("** Disconnect Greaseweazle and remove the Programming Jumper.")
 
 
 def main(argv):
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("file", nargs="?", default="auto",
-                        help="update filename")
-    parser.add_argument("device", nargs="?", default="auto",
-                        help="serial device")
+    parser = util.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("file", nargs="?", help="update filename")
+    parser.add_argument("device", nargs="?", help="serial device")
+    parser.add_argument("--bootloader", action="store_true",
+                        help="update the bootloader (use with caution!)")
+    parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
 
-    usb = util.usb_open(args.device, is_update=True)
-
     try:
+        usb = util.usb_open(args.device, is_update=not args.bootloader)
         update_firmware(usb, args)
     except USB.CmdError as error:
         print("Command Failed: %s" % error)

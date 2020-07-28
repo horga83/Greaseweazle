@@ -1,5 +1,5 @@
 /*
- * floppy_f1.c
+ * f1/floppy.c
  * 
  * Floppy interface control: STM32F103C8.
  * 
@@ -57,6 +57,10 @@ typedef uint16_t timcnt_t;
 #define irq_index 23
 void IRQ_23(void) __attribute__((alias("IRQ_INDEX_changed"))); /* EXTI9_5 */
 
+/* We sometimes cast u_buf to uint32_t[], hence the alignment constraint. */
+#define U_BUF_SZ 8192
+static uint8_t u_buf[U_BUF_SZ] aligned(4);
+
 static void floppy_mcu_init(void)
 {
     /* Determine whether input pins must be internally pulled down. */
@@ -78,6 +82,9 @@ static void floppy_mcu_init(void)
     /* Configure SELECT/MOTOR lines. */
     configure_pin(sel, GPO_bus);
     configure_pin(mot, GPO_bus);
+
+    /* Configure user-modifiable lines. */
+    configure_pin(densel, GPO_bus);
 }
 
 static void rdata_prep(void)
@@ -170,6 +177,19 @@ static void reset_bus(void)
 {
     write_pin(sel, FALSE);
     write_pin(mot, FALSE);
+}
+
+static uint8_t set_user_pin(unsigned int pin, unsigned int level)
+{
+    if (pin != 2)
+        return ACK_BAD_PIN;
+    gpio_write_pin(gpio_densel, pin_densel, level);
+    return ACK_OKAY;
+}
+
+static void reset_user_pins(void)
+{
+    write_pin(densel, FALSE);
 }
 
 /*

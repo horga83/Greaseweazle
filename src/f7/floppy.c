@@ -1,5 +1,5 @@
 /*
- * floppy_f7.c
+ * f7/floppy.c
  * 
  * Floppy interface control: STM32F730x8.
  * 
@@ -12,8 +12,12 @@
 #define O_FALSE 1
 #define O_TRUE  0
 
-#define GPO_bus GPO_opendrain(IOSPD_LOW,O_FALSE)
-#define AFO_bus AFO_opendrain(IOSPD_LOW)
+#define GPO_bus_pp GPO_pushpull(IOSPD_LOW,O_FALSE)
+#define AFO_bus_pp AFO_pushpull(IOSPD_LOW)
+#define GPO_bus_od GPO_opendrain(IOSPD_LOW,O_FALSE)
+#define AFO_bus_od AFO_opendrain(IOSPD_LOW)
+static unsigned int GPO_bus;
+static unsigned int AFO_bus;
 #define GPI_bus GPI_floating
 
 /* Input pins */
@@ -25,8 +29,6 @@
 #define pin_wrprot  1 /* PA1 */
 
 /* Output pins. */
-#define gpio_densel gpiob
-#define pin_densel 12 /* PB12 */
 #define gpio_pin10 gpiob
 #define pin_pin10  1  /* PB1 */
 #define gpio_pin12 gpiob
@@ -61,8 +63,14 @@ typedef uint32_t timcnt_t;
 #define irq_index 8
 void IRQ_8(void) __attribute__((alias("IRQ_INDEX_changed"))); /* EXTI2 */
 
+/* We sometimes cast u_buf to uint32_t[], hence the alignment constraint. */
+#define U_BUF_SZ (128*1024)
+static uint8_t u_buf[U_BUF_SZ] aligned(4) section_ext_ram;
+
 static void floppy_mcu_init(void)
 {
+    const struct user_pin *upin;
+
     /* Enable clock for Timer 2. */
     rcc->apb1enr |= RCC_APB1ENR_TIM2EN;
     peripheral_clock_delay();
@@ -71,6 +79,16 @@ static void floppy_mcu_init(void)
     gpio_set_af(gpio_rdata, pin_rdata, 1);
     gpio_set_af(gpio_wdata, pin_wdata, 1);
     configure_pin(rdata, AFI(PUPD_none));
+
+    /* Configure user-modifiable pins. */
+    for (upin = board_config->user_pins; upin->pin_id != 0; upin++) {
+        gpio_configure_pin(gpio_from_id(upin->gpio_bank), upin->gpio_pin,
+                           upin->push_pull ? GPO_bus_pp : GPO_bus_od);
+    }
+
+    /* Configure the standard output types. */
+    GPO_bus = upin->push_pull ? GPO_bus_pp : GPO_bus_od;
+    AFO_bus = upin->push_pull ? AFO_bus_pp : AFO_bus_od;
 
     /* Configure SELECT/MOTOR lines. */
     configure_pin(pin10, GPO_bus);
@@ -240,6 +258,29 @@ static void reset_bus(void)
     write_pin(pin12, FALSE);
     write_pin(pin14, FALSE);
     write_pin(pin16, FALSE);
+}
+
+static uint8_t set_user_pin(unsigned int pin, unsigned int level)
+{
+    const struct user_pin *upin;
+
+    for (upin = board_config->user_pins; upin->pin_id != 0; upin++) {
+        if (upin->pin_id == pin)
+            goto found;
+    }
+    return ACK_BAD_PIN;
+
+found:
+    gpio_write_pin(gpio_from_id(upin->gpio_bank), upin->gpio_pin, level);
+    return ACK_OKAY;
+}
+
+static void reset_user_pins(void)
+{
+    const struct user_pin *upin;
+
+    for (upin = board_config->user_pins; upin->pin_id != 0; upin++)
+        gpio_write_pin(gpio_from_id(upin->gpio_bank), upin->gpio_pin, O_FALSE);
 }
 
 /*

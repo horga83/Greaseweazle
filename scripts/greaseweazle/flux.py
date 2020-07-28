@@ -11,6 +11,7 @@ class Flux:
         self.index_list = index_list
         self.list = flux_list
         self.sample_freq = sample_freq
+        self.terminate_at_index = True
 
 
     def __str__(self):
@@ -23,20 +24,8 @@ class Flux:
         return s[:-1]
 
 
-    @classmethod
-    def from_bitarray(cls, bitarray, bitrate, timing=None):
-        if not timing:
-            timing = [1000] * len(bitarray)
-        timing_i = iter(timing)
-        flux_list = []
-        count = 0
-        for bit in bitarray:
-            count += next(timing_i)
-            if bit:
-                flux_list.append(count)
-                count = 0
-        flux_list[0] += count
-        return Flux([sum(flux_list)], flux_list, bitrate * 1000)
+    def flux_for_writeout(self):
+        return self
 
  
 # Local variables:

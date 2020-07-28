@@ -7,7 +7,9 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
-import sys, argparse
+description = "Report the available USB bandwidth for the Greaseweazle device."
+
+import sys
 
 from timeit import default_timer as timer
 
@@ -15,36 +17,47 @@ from greaseweazle.tools import util
 from greaseweazle import usb as USB
 
 def measure_bandwidth(usb, args):
-    print("                 Min   / Mean  / Max")
+    print()
+    print("%19s%-7s/   %-7s/   %-7s" % ("", "Min.", "Mean", "Max."))
 
     w_nr = 1000000
     start = timer()
     usb.sink_bytes(w_nr)
     end = timer()
-    av_bw = (w_nr * 8) / ((end-start) * 1000000)
-    min_bw, max_bw = usb.bw_stats()
-    print("Write Bandwidth: %.3f / %.3f / %.3f Mbps"
-          % (min_bw, av_bw, max_bw))
+    av_w_bw = (w_nr * 8) / ((end-start) * 1e6)
+    min_w_bw, max_w_bw = usb.bw_stats()
+    print("Write Bandwidth: %8.3f / %8.3f / %8.3f Mbps"
+          % (min_w_bw, av_w_bw, max_w_bw))
     
     r_nr = 1000000
     start = timer()
     usb.source_bytes(r_nr)
     end = timer()
-    av_bw = (r_nr * 8) / ((end-start) * 1000000)
-    min_bw, max_bw = usb.bw_stats()
-    print("Read Bandwidth:  %.3f / %.3f / %.3f Mbps"
-          % (min_bw, av_bw, max_bw))
+    av_r_bw = (r_nr * 8) / ((end-start) * 1e6)
+    min_r_bw, max_r_bw = usb.bw_stats()
+    print("Read Bandwidth:  %8.3f / %8.3f / %8.3f Mbps"
+          % (min_r_bw, av_r_bw, max_r_bw))
 
+    est_min_bw = 0.9 * min(min_r_bw, min_w_bw)
+    print()
+    print("Estimated Consistent Min. Bandwidth: %.3f Mbps" % est_min_bw)
+    max_flux_rate = ((est_min_bw * 0.9) * 1e6) / 8
+    
     twobyte_us = 249/72 # Smallest time requiring a 2-byte transmission code
-    min_bw = 16 / twobyte_us # Bandwidth (Mbps) to transmit above time
-    print("Minimum *consistent* bandwidth required: %.3f Mbps" % min_bw)
+    req_min_bw = 16 / twobyte_us # Bandwidth (Mbps) to transmit above time
+    if req_min_bw > est_min_bw:
+        print(" -> **WARNING** BELOW REQUIRED MIN.: %.3f Mbps" % req_min_bw)
+    else:
+        print(" -> Max. Flux Rate: %.3f Msamples/sec"
+              % (max_flux_rate / 1e6))
+        print(" -> Min. Ave. Flux: %.3f us"
+              % (1e6 / max_flux_rate))
 
 def main(argv):
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("device", nargs="?", default="auto",
-                        help="serial device")
+    parser = util.ArgumentParser()
+    parser.add_argument("device", nargs="?", help="serial device")
+    parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
 

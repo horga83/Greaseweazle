@@ -1,18 +1,24 @@
-# mk_update.py
+# mk_update.py new <output> <bootloader> <main_firmware> <stm_model>
+# mk_update.py cat <output> <update_file>*
+# mk_update.py verify <update_file>*
 #
 # Convert a raw firmware binary into an update file for our bootloader.
 #
 # Update Format (Little endian, unless otherwise stated):
+#   File Header:
+#     4 bytes: 'GWUP'
 #   Catalogue Header:
 #     2 bytes: <length> (excludes Catalogue Header)
-#     2 bytes: <hw_type>
+#     2 bytes: <hw_model>
 #   Payload:
 #     N bytes: <raw binary data>
 #   Footer:
-#     2 bytes: 'GW'
+#     2 bytes: 'GW' or 'BL'
 #     2 bytes: major, minor
-#     2 bytes: <hw_type>
+#     2 bytes: <hw_model>
 #     2 bytes: CRC16-CCITT, seed 0xFFFF (big endian, excludes Catalogue Header)
+#   File Footer:
+#     4 bytes: CRC32 (MPEG-2, big endian)
 #
 # Written & released by Keir Fraser <keir.xen@gmail.com>
 #
@@ -24,22 +30,79 @@ import re, struct, sys
 
 from greaseweazle import version
 
-def main(argv):
-    in_f = open(argv[1], "rb")
-    out_f = open(argv[2], "wb")
-    hw_type = int(re.match("f(\d)", argv[3]).group(1))
-    in_dat = in_f.read()
-    in_len = len(in_dat)
-    assert (in_len & 3) == 0, "input is not longword padded"
+def mk_cat_entry(dat, hw_model, sig):
+    max_kb = { 1: { b'BL':  8, b'GW': 56 },
+               7: { b'BL': 16, b'GW': 48 } }
+    dlen = len(dat)
+    assert (dlen & 3) == 0, "input is not longword padded"
+    assert dlen <= max_kb[hw_model][sig]*1024, "input is too long"
+    header = struct.pack("<2H", dlen + 8, hw_model)
+    footer = struct.pack("<2s2BH", sig, version.major, version.minor, hw_model)
     crc16 = crcmod.predefined.Crc('crc-ccitt-false')
-    out_f.write(struct.pack("<2H", in_len + 8, hw_type))
-    out_f.write(in_dat)
-    crc16.update(in_dat)
-    in_dat = struct.pack("<2s2BH", b'GW', version.major, version.minor, hw_type)
-    out_f.write(in_dat)
-    crc16.update(in_dat)
-    in_dat = struct.pack(">H", crc16.crcValue)
-    out_f.write(in_dat)
+    crc16.update(dat)
+    crc16.update(footer)
+    footer += struct.pack(">H", crc16.crcValue)
+    return header + dat + footer
+
+def new_upd(argv):
+    dat = b'GWUP'
+    hw_model = int(re.match("f(\d)", argv[2]).group(1))
+    with open(argv[1], "rb") as gw_f:
+        dat += mk_cat_entry(gw_f.read(), hw_model, b'GW')
+    with open(argv[0], "rb") as bl_f:
+        dat += mk_cat_entry(bl_f.read(), hw_model, b'BL')
+    return dat
+
+def cat_upd(argv):
+    dat = b'GWUP'
+    for fname in argv:
+        with open(fname, "rb") as f:
+            d = f.read()
+        assert struct.unpack('4s', d[:4])[0] == b'GWUP'
+        crc32 = crcmod.predefined.Crc('crc-32-mpeg')
+        crc32.update(d)
+        assert crc32.crcValue == 0
+        dat += d[4:-4]
+    return dat
+
+def _verify_upd(d):
+    assert struct.unpack('4s', d[:4])[0] == b'GWUP'
+    crc32 = crcmod.predefined.Crc('crc-32-mpeg')
+    crc32.update(d)
+    assert crc32.crcValue == 0
+    d = d[4:-4]
+    while d:
+        upd_len, hw_model = struct.unpack("<2H", d[:4])
+        upd_type, major, minor = struct.unpack("2s2B", d[upd_len-4:upd_len])
+        crc16 = crcmod.predefined.Crc('crc-ccitt-false')
+        crc16.update(d[4:upd_len+4])
+        assert crc16.crcValue == 0
+        print('F%u %s v%u.%u' % (hw_model,
+                                 {b'BL': 'Boot', b'GW': 'Main'}[upd_type],
+                                 major, minor))
+        d = d[upd_len+4:]
+
+def verify_upd(argv):
+    for fname in argv:
+        with open(fname, "rb") as f:
+            d = f.read()
+        _verify_upd(d)
+    
+def main(argv):
+    if argv[1] == 'new':
+        dat = new_upd(argv[3:])
+    elif argv[1] == 'cat':
+        dat = cat_upd(argv[3:])
+    elif argv[1] == 'verify':
+        verify_upd(argv[2:])
+        return
+    else:
+        assert False
+    crc32 = crcmod.predefined.Crc('crc-32-mpeg')
+    crc32.update(dat)
+    dat += struct.pack(">I", crc32.crcValue)
+    with open(argv[2], "wb") as out_f:
+        out_f.write(dat)
 
 if __name__ == "__main__":
     main(sys.argv)

@@ -7,15 +7,17 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
-import sys, argparse
+description = "Display (and optionally modify) Greaseweazle \
+drive-delay parameters."
+
+import sys
 
 from greaseweazle.tools import util
 from greaseweazle import usb as USB
 
 def main(argv):
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = util.ArgumentParser()
     parser.add_argument("--select", type=int,
                         help="delay after drive select (usecs)")
     parser.add_argument("--step", type=int,
@@ -26,8 +28,8 @@ def main(argv):
                         help="delay after motor on (msecs)")
     parser.add_argument("--auto-off", type=int,
                         help="quiescent time until auto deselect (msecs)")
-    parser.add_argument("device", nargs="?", default="auto",
-                        help="serial device")
+    parser.add_argument("device", nargs="?", help="serial device")
+    parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
 

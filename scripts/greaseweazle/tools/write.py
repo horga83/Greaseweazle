@@ -7,14 +7,28 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
-import sys, argparse
+description = "Write a disk from the specified image file."
+
+import sys
 
 from greaseweazle.tools import util
 from greaseweazle import usb as USB
 
+
+# Read and parse the image file.
+def open_image(args):
+    image_class = util.get_image_class(args.file)
+    if hasattr(image_class, 'from_filename'):
+        image = image_class.from_filename(args.file)
+    else:
+        with open(args.file, "rb") as f:
+            image = image_class.from_file(f.read())
+    return image
+
+
 # write_from_image:
 # Writes the specified image file to floppy disk.
-def write_from_image(usb, args):
+def write_from_image(usb, args, image):
 
     # @drive_ticks is the time in Greaseweazle ticks between index pulses.
     # We will adjust the flux intervals per track to allow for this.
@@ -22,26 +36,22 @@ def write_from_image(usb, args):
     drive_ticks = (flux.index_list[0] + flux.index_list[1]) / 2
     del flux
 
-    # Read and parse the image file.
-    image_class = util.get_image_class(args.file)
-    if not image_class:
-        return
-    if hasattr(image_class, 'from_filename'):
-        image = image_class.from_filename(args.file)
-    else:
-        with open(args.file, "rb") as f:
-            image = image_class.from_file(f.read())
-
     for cyl in range(args.scyl, args.ecyl+1):
         for side in range(0, args.nr_sides):
 
-            print("\rWriting Track %u.%u..." % (cyl, side), end="")
-            usb.seek(cyl, side)
+            track = image.get_track(cyl, side, writeout=True)
+            if track is None and not args.erase_empty:
+                continue
 
-            flux = image.get_track(cyl, side, writeout=True)
-            if not flux:
+            print("\r%sing Track %u.%u..." %
+                  ("Writ" if track is not None else "Eras", cyl, side), end="")
+            usb.seek((cyl, cyl*2)[args.double_step], side)
+            
+            if track is None:
                 usb.erase_track(drive_ticks * 1.1)
                 continue
+
+            flux = track.flux_for_writeout()
             
             # @factor adjusts flux times for speed variations between the
             # read-in and write-out drives.
@@ -57,15 +67,14 @@ def write_from_image(usb, args):
                 flux_list.append(val)
 
             # Encode the flux times for Greaseweazle, and write them out.
-            usb.write_track(flux_list)
+            usb.write_track(flux_list, flux.terminate_at_index)
 
     print()
 
 
 def main(argv):
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = util.ArgumentParser()
     parser.add_argument("--drive", type=util.drive_letter, default='A',
                         help="drive to write (A,B,0,1,2)")
     parser.add_argument("--scyl", type=int, default=0,
@@ -74,16 +83,21 @@ def main(argv):
                         help="last cylinder to write")
     parser.add_argument("--single-sided", action="store_true",
                         help="single-sided write")
+    parser.add_argument("--double-step", action="store_true",
+                        help="double-step drive heads")
+    parser.add_argument("--erase-empty", action="store_true",
+                        help="erase empty tracks (default: skip)")
     parser.add_argument("file", help="input filename")
-    parser.add_argument("device", nargs="?", default="auto",
-                        help="serial device")
+    parser.add_argument("device", nargs="?", help="serial device")
+    parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
     args.nr_sides = 1 if args.single_sided else 2
 
     try:
         usb = util.usb_open(args.device)
-        util.with_drive_selected(write_from_image, usb, args)
+        image = open_image(args)
+        util.with_drive_selected(write_from_image, usb, args, image)
     except USB.CmdError as error:
         print("Command Failed: %s" % error)
 

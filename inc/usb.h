@@ -9,8 +9,10 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-/* Full Speed Max Packet Size */
+/* Max Packet Size */
 #define USB_FS_MPS 64
+#define USB_HS_MPS 512
+extern unsigned int usb_bulk_mps;
 
 /* Class-specific callback hooks */
 struct usb_class_ops {
@@ -41,6 +43,9 @@ bool_t ep_tx_ready(uint8_t ep);
 /* Queue the next IN packet, with the given payload data. 
  * REQUIRES: ep_tx_ready(@ep) == TRUE */
 void usb_write(uint8_t ep, const void *buf, uint32_t len);
+
+/* Is the USB enumerated at High Speed? */
+bool_t usb_is_highspeed(void);
 
 /*
  * Local variables:

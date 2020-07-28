@@ -7,6 +7,8 @@
 # This is free and unencumbered software released into the public domain.
 # See the file COPYING for more details, or visit <http://unlicense.org>.
 
+description = "Change the setting of a user-modifiable interface pin."
+
 import sys, argparse
 
 from greaseweazle.tools import util
@@ -20,14 +22,13 @@ def level(letter):
 
 def main(argv):
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = util.ArgumentParser()
     parser.add_argument("pin", type=int,
                         help="pin number")
     parser.add_argument("level", type=level,
                         help="pin level (H,L)")
-    parser.add_argument("device", nargs="?", default="auto",
-                        help="serial device")
+    parser.add_argument("device", nargs="?", help="serial device")
+    parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
 

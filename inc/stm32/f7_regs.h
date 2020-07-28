@@ -18,6 +18,37 @@ struct dbg {
 
 #define DBG_BASE 0xe0042000
 
+struct cpufeat {
+    uint32_t clidr;      /* 00: Cache level ID */
+    uint32_t ctr;        /* 04: Cache type */
+    uint32_t ccsidr;     /* 08: Cache size ID */
+    uint32_t csselr;     /* 10: Cache size selection */
+};
+
+#define CCSIDR_SETS(x) (((x)>>13)&0x7fffu)
+#define CCSIDR_WAYS(x) (((x)>> 3)& 0x3ffu)
+
+#define CPUFEAT_BASE 0xe000ed78
+
+struct cache {
+    uint32_t iciallu;    /* 00: ICache invalidate all to PoU */
+    uint32_t _unused0;
+    uint32_t icimvau;    /* 08: ICache invalidate by address to PoU */
+    uint32_t dcimvac;    /* 0C: DCache invalidate by address to PoC */
+    uint32_t dcisw;      /* 10: DCache invalidate by set/way */
+    uint32_t dccmvau;    /* 14: DCache clean by adress to PoU */
+    uint32_t dccmvac;    /* 18: DCache clean by address to PoC */
+    uint32_t dccsw;      /* 1C: DCache clean by set/way */
+    uint32_t dccimvac;   /* 20: DCache clean & invalidate by address to PoC */
+    uint32_t dccisw;     /* 24: DCache clean & invalidate by set/way */
+    uint32_t bpiall;
+};
+
+#define DCISW_WAY(x)  ((x)<<30)
+#define DCISW_SET(x)  ((x)<< 5)
+
+#define CACHE_BASE 0xe000ef50    
+
 /* Flash memory interface */
 struct flash {
     uint32_t acr;      /* 00: Flash access control */
@@ -65,7 +96,30 @@ struct pwr {
     uint32_t csr2;     /* 0C: Power control/status #2 */
 };
 
+#define PWR_CR1_UDEN(x)      ((x)<<18)
+#define PWR_CR1_ODSWEN       (1u<<17)
+#define PWR_CR1_ODEN         (1u<<16)
+#define PWR_CR1_VOS(x)       ((x)<<14)
+#define PWR_CR1_ADCDC1       (1u<<13)
+#define PWR_CR1_MRUDS        (1u<<11)
+#define PWR_CR1_LPUDS        (1u<<10)
+#define PWR_CR1_FPDS         (1u<< 9)
 #define PWR_CR1_DBP          (1u<< 8)
+#define PWR_CR1_PLS(x)       ((x)<<5)
+#define PWR_CR1_PVDE         (1u<< 4)
+#define PWR_CR1_CSBF         (1u<< 3)
+#define PWR_CR1_PDDS         (1u<< 1)
+#define PWR_CR1_LPDS         (1u<< 0)
+
+#define PWR_CSR1_ODSWRDY     (1u<<17)
+#define PWR_CSR1_ODRDY       (1u<<16)
+#define PWR_CSR1_VOSRDY      (1u<<14)
+#define PWR_CSR1_BRE         (1u<< 9)
+#define PWR_CSR1_EIWUP       (1u<< 8)
+#define PWR_CSR1_BRR         (1u<< 3)
+#define PWR_CSR1_PVDO        (1u<< 2)
+#define PWR_CSR1_SBF         (1u<< 1)
+#define PWR_CSR1_WUIF        (1u<< 0)
 
 #define PWR_BASE 0x40007000
 

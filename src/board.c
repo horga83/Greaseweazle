@@ -9,14 +9,6 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#if STM32F == 1
-#define gpio_led gpioc
-#define pin_led 13
-#elif STM32F == 7
-#define gpio_led gpiob
-#define pin_led 13
-#endif
-
 /* Pull up currently unused and possibly-floating pins. */
 static void gpio_pull_up_pins(GPIO gpio, uint16_t mask)
 {
@@ -28,18 +20,15 @@ static void gpio_pull_up_pins(GPIO gpio, uint16_t mask)
     }
 }
 
+#if STM32F == 1
+#include "f1/board.c"
+#elif STM32F == 7
+#include "f7/board.c"
+#endif
+
 void board_init(void)
 {
-    /* Pull up all unused pins. */
-    if (STM32F == 1) {
-        gpio_pull_up_pins(gpioa, 0xe1fe); /* PA1-8,13-15 */
-        gpio_pull_up_pins(gpiob, 0x0027); /* PB0-2,5 */
-        gpio_pull_up_pins(gpioc, 0xffff); /* PC0-15 */
-    } else if (STM32F == 7) {
-        gpio_pull_up_pins(gpioa, 0x9930); /* PA4-5,8,11-12,15 */
-        gpio_pull_up_pins(gpiob, 0x23f8); /* PB3-9,13 */
-        gpio_pull_up_pins(gpioc, 0xffe7); /* PC0-2,5-15 */
-    }
+    mcu_board_init();
 
 #ifdef NDEBUG
     /* Pull up unused debug pins (A9,A10 = serial console). */
